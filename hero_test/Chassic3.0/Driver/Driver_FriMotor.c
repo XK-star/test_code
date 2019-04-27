@@ -1,0 +1,465 @@
+#include "Driver_FriMotor.h"
+#include "main.h"
+#include "tim.h"
+#include "pid.h"
+#include "StatusMachine.h"
+#include "CanBusTask.h"
+#include "gpio.h"
+#include "SuperviseTask.h"
+#include "IOTask.h"
+#include "Ramp.h"
+#include "Remote.h"
+#include "Driver_LevelLimit.h" 
+#include "math.h"
+
+
+#define BulletTurntableSpeed 30
+//#define RM3508
+PID_Regulator_t ShootMotorSpeedPID = SHOOT_MOTOR_SPEED_PID_DEFAULT;
+PID_Regulator_t ShootMotorPositionPID = SHOOT_MOTOR_SPEED_PID_DEFAULT;
+PID_Regulator_t BulletTurntableSpeedPID = BULLET_TURNTABLE_PID_DEFAULT;
+PID_Regulator_t BulletTurntablePositionPID = BULLET_TURNTABLE_PID_DEFAULT;
+PID_Regulator_t FriMotorRightPID = FRIMOTOR_PID_DEFAULT;
+PID_Regulator_t FriMotorLeftPID = FRIMOTOR_PID_DEFAULT;
+
+RampGen_t  FriMotorRamp=RAMP_GEN_DAFAULT;
+
+Turntale_ref_t Turntable_ref;
+Turntale_ref_t BulletTurntable_ref;
+
+int16_t frimotor_speed=0;
+int16_t turntable_angle;
+
+extern FrictionWheelState_e friction_wheel_state;
+
+void LASER_Task(void)
+{
+	//无遥控器信号 激光2Hz闪烁
+	if(DBUSFrameRate<10)
+	{
+		static uint32_t count = 0;
+		count++;
+		if(count > 500)
+		{
+			count = 0;
+			LASER_TOGGLE();
+		}
+	}
+	else if(GetWorkState()==TEST_STATE )
+	{
+				LASER_ON();
+	}
+	else
+	{
+		if(GetFrictionState() == FRICTION_WHEEL_ON)//摩擦轮开转 用激光来指示弹舱状态
+		{
+				LASER_ON();
+			
+		}
+		else if(GetFrictionState() ==FRICTION_WHEEL_TURNNING)
+		{
+			LASER_TOGGLE();
+		}
+		else if(GetFrictionState() == FRICTION_WHEEL_OFF)
+		{
+			LASER_OFF();
+		}
+	}
+}
+
+
+#define EGG_HOME_OPEN()		 {TIM5->CCR4 = 2000; EGG_HOME_State =1;}
+#define EGG_HOME_CLOSE()    {TIM5->CCR4 = 830; EGG_HOME_State = 0;}
+uint8_t EGG_HOME_State = 0;
+
+uint8_t Get_EGG_HOME_State(void)
+{
+	return EGG_HOME_State;
+}
+void EGG_HOME_Control(void)
+{
+	//键盘模式
+	if(GetInputMode() == KEY_MOUSE_INPUT)
+	{
+		static uint32_t Change_Time_Stamp = 0;
+		if(Remote_CheckJumpKey(KEY_R) == 1 && Get_Time_Micros() - Change_Time_Stamp > 500000)
+		{
+			Change_Time_Stamp = Get_Time_Micros();
+			//切换状态
+			if(Get_EGG_HOME_State() == 0)
+			{
+				EGG_HOME_OPEN();
+			}
+			else
+			{
+				EGG_HOME_CLOSE();	
+			}
+		}
+	}//遥控器模式
+	else if(GetInputMode() == REMOTE_INPUT)
+	{
+		if(GetFrictionState() == FRICTION_WHEEL_ON || GetFrictionState() == FRICTION_WHEEL_TURNNING)
+		{
+			EGG_HOME_CLOSE();
+		}
+		else
+		{
+			EGG_HOME_OPEN();
+		}
+	}
+	else
+	{
+		EGG_HOME_OPEN();
+	}
+}
+
+/****************************************摩擦轮*****************************************/
+uint16_t sp=2000;
+//摩擦轮启动占空比为4%
+static uint32_t Time_Mark;
+void FriMotor_Control(void)
+{                  
+//	FriMotorRightPID.kp=FriMotorLeftPID.kp=AppParamRealUsed.TurntablePositionPID.kp_offset;
+//	FriMotorRightPID.ki=FriMotorLeftPID.ki=AppParamRealUsed.TurntablePositionPID.ki_offset/1000.0;
+//	FriMotorRightPID.kd=FriMotorLeftPID.kd=AppParamRealUsed.TurntablePositionPID.kd_offset;
+	
+//		SetFrictionWheelSpeed(sp);
+
+	
+	switch(friction_wheel_state)  
+	{
+		#ifdef RM3508
+				case FRICTION_WHEEL_OFF:
+		{	              
+			Time_Mark = Get_Time_Micros();  
+			SetFrictionWheelSpeed(0);
+	//    Set_Little_Gimbal(&hcan2,0,0,0,0 );
+
+		}break;
+		
+		case FRICTION_WHEEL_TURNNING:
+		{	
+
+			SetFrictionWheelSpeed(BULLET_SPEED);
+			SetFrictionWheelSpeed3508(MOTOR_SPEED*FriMotorRamp.Calc(&FriMotorRamp));               
+			//起转超过1.5s 进入ON模式
+			if(Get_Time_Micros() - Time_Mark > 1500000)
+			{
+				friction_wheel_state = FRICTION_WHEEL_ON;//强行将状态变成ON 
+                                                                            
+			}
+//				PID_Task(&FriMotorRightPID, frimotor_speed, FriR_Measure.speed_rpm);		
+//				PID_Task(&FriMotorLeftPID, -frimotor_speed, FriL_Measure.speed_rpm);		
+//        Set_Little_Gimbal(&hcan2,FriMotorRightPID.output ,FriMotorLeftPID.output,0,0 );
+
+		}break;	
+		case FRICTION_WHEEL_ON:
+		{
+
+			SetFrictionWheelSpeed(BULLET_SPEED);			
+			SetFrictionWheelSpeed3508(MOTOR_SPEED);
+
+		}break;
+		                                                                                                                          
+		default:break;
+	}
+				PID_Task(&FriMotorRightPID, frimotor_speed, FriR_Measure.speed_rpm);		
+				PID_Task(&FriMotorLeftPID, -frimotor_speed, FriL_Measure.speed_rpm);		
+        Set_Little_Gimbal(&hcan2,FriMotorRightPID.output ,FriMotorLeftPID.output,0,0 );
+
+		#else
+				case FRICTION_WHEEL_OFF:
+		{	              
+			SetFrictionWheelSpeed(800);
+			Time_Mark = Get_Time_Micros();  
+
+		}break;
+		
+		case FRICTION_WHEEL_TURNNING:
+		{	
+
+			SetFrictionWheelSpeed(BULLET_SPEED);
+			SetFrictionWheelSpeed3508(MOTOR_SPEED*FriMotorRamp.Calc(&FriMotorRamp));               
+			//起转超过1.5s 进入ON模式
+			if(Get_Time_Micros() - Time_Mark > 1500000)
+			{
+				friction_wheel_state = FRICTION_WHEEL_ON;//强行将状态变成ON 
+                                                                            
+			}
+
+		}break;	
+		case FRICTION_WHEEL_ON:
+		{
+
+			SetFrictionWheelSpeed(BULLET_SPEED);			
+			SetFrictionWheelSpeed3508(MOTOR_SPEED);
+
+		}break;
+		                                                                                                                          
+		default:break;
+	}
+        Set_Little_Gimbal(&hcan2,FriMotorRightPID.output ,FriMotorLeftPID.output,0,0 );
+
+		#endif
+
+}
+
+/****************************************拨盘*****************************************/
+uint8_t  BulletNumber = 0;
+uint32_t Block_TimeStamp=0;
+uint8_t BulletBlock_State=0;
+	static uint32_t Stuck_Count = 0;
+uint32_t ii = 0;
+void BulletStuck_Check(void)
+{
+	if(abs(ShootMotorSpeedPID.ref) >1000 && abs(ShootMotorSpeedPID.fdb) <400)
+	{
+		Stuck_Count++;
+		ii++;
+	}
+	else
+	{
+		Stuck_Count = 0;
+	}
+	
+	if(Stuck_Count> 200)//这个数等于 卡弹判断阈值(ms)/函数调用周期(ms)
+	{
+		Block_TimeStamp = Get_Time_Micros();
+		BulletBlock_State = 1;
+//		Laser_Warnning(100);
+	}
+	else
+	{
+		BulletBlock_State = 0;
+	}
+}	
+	
+//更新卡弹的时间戳-->上方弹仓
+uint32_t BulletBlock_TimeStamp = 0;	//卡弹时间戳
+uint8_t BulletBlock_up_State=0;
+
+void BulletStuck_Check_up(void)
+{
+	static uint32_t BulletStuck_Count = 0;
+	if(abs(BulletTurntableSpeedPID.ref) >20 &&fabs(BulletTurntableSpeedPID.fdb) < 2)
+	{
+		BulletStuck_Count++;
+	}
+	else
+	{
+		BulletStuck_Count = 0;
+	}
+	
+	if(BulletStuck_Count> 200)//这个数等于 卡弹判断阈值(ms)/函数调用周期(ms)
+	{
+		BulletBlock_TimeStamp = Get_Time_Micros();
+		BulletBlock_up_State = 1;
+//		Laser_Warnning(100);
+	}
+	else
+	{
+		BulletBlock_up_State = 0;
+	}
+}
+
+uint8_t pass_flag;
+void Pass_Check()
+{
+	static uint8_t Passdoor = 1;                              
+	if(Psensor_Check() && Passdoor)
+	{   
+		pass_flag = 1;
+		Passdoor = 0;
+	}
+	else if(!Psensor_Check())
+		Passdoor = 1;
+	else
+		pass_flag = 0;
+}
+
+float ShootNumber;
+void ShootCounter(void)
+{
+	Pass_Check();
+	if(pass_flag)
+	{
+		ShootNumber += 1;
+	}
+}   
+
+float Turntable_Angle = 0;
+
+//发射单颗子弹命令 每调用一次拨盘转90°
+uint8_t shootdouble=0;
+uint8_t shootnum=0;
+void Shoot_Single(uint8_t num)
+{
+	
+		if(Turntable_ref.Angle - TurntableEncoder.ecd_angle/REDUCTION <135.0f)
+		{
+//			Turntable_ref.Angle = PreShoot_Angle;//校准拨盘角度
+			Turntable_ref.Angle += 90*1;		//转动一个子弹的角度
+			BulletTurntable_ref.Angle += 51.5*1;	
+		}
+		
+}
+void Bullter_Single(uint8_t num)
+{
+	
+		if(BulletTurntable_ref.Angle - BulletEncoder.ecd_angle/19.0f <180.0f)
+		{
+//			Turntable_ref.Angle = PreShoot_Angle;//校准拨盘角度
+			BulletTurntable_ref.Angle += 180*1;		//转动一个子弹的角度
+		}
+		
+}
+
+void Turntable_Cail()
+{
+	static int16_t  angle,angle0,angle1,angle2,angle3;
+	ShootMotorSpeedPID.kp = 9;
+	ShootMotorSpeedPID.ki = 0.1;
+	ShootMotorSpeedPID.kd = 3;
+	ShootMotorPositionPID.kp = 200;
+	ShootMotorPositionPID.ki = 0;//AppParamRealUsed.TurntablePositionPID.ki_offset/1000.0;
+	ShootMotorPositionPID.kd = 0;//AppParamRealUsed.TurntablePositionPID.kd_offset;
+	Turntable_ref.Speed = 7000;
+	BulletTurntableSpeedPID.kp = 400;
+	BulletTurntableSpeedPID.ki = 0;         
+	BulletTurntableSpeedPID.kd = 0;
+
+	Turntable_ref.Angle = TurntableEncoder.ecd_angle/36.0f;
+	turntable_angle=AppParamRealUsed.TurntableCaliData.TurnTableOffset/REDUCTION2006;
+	angle0=turntable_angle-(int16_t)(TurntableEncoder.ecd_angle/REDUCTION2006)%360;
+	angle1=(turntable_angle+90)%360-(int16_t)(TurntableEncoder.ecd_angle/REDUCTION2006)%360;
+	angle2=(turntable_angle+180)%360-(int16_t)(TurntableEncoder.ecd_angle/REDUCTION2006)%360;
+	angle3=(turntable_angle+270)%360-(int16_t)(TurntableEncoder.ecd_angle/REDUCTION2006)%360;
+	
+	angle=angle0;
+	if(abs(angle0)>abs(angle1))
+		angle=angle1;
+		if(abs(angle)>abs(angle2))
+		angle=angle2;
+	if(abs(angle)>abs(angle3))
+		angle=angle3;
+	
+	Turntable_ref.Angle+=angle;
+	
+
+}
+uint8_t turn_flag;
+void Turntable_Control(void)
+{
+	
+//	uint8_t Attack_Change_Flag = Attack_Switch_Check();
+	BulletStuck_Check();
+	BulletStuck_Check_up();
+////	if(Attack_Change_Flag == 1 || Get_Time_Micros() <4000000)
+////	{
+//		if(Get_Time_Micros() <5000)
+//	{
+//		Turntable_ref.Angle =TurntableEncoder.ecd_angle/REDUCTION2006;//START_EDCANGLE/REDUCTION2006;
+
+//	}
+	
+	if(WorkState==PREPARE_STATE)
+	{
+		if(turn_flag)
+		{
+		Turntable_Cail();
+			turn_flag=0;
+		}
+	  PID_Task(&ShootMotorPositionPID, Turntable_ref.Angle, TurntableEncoder.ecd_angle/REDUCTION2006);
+	  PID_Task(&ShootMotorSpeedPID, ShootMotorPositionPID.output, Turntable_Measure.speed_rpm);
+
+	}
+	else
+	{
+			static InputMode_e last_Input;
+	static InputMode_e now_Input;
+	if(GetFrictionState() == FRICTION_WHEEL_ON)
+	{	
+		now_Input = GetInputMode();
+		if(last_Input != now_Input)
+		{                                                             
+	 		last_Input = now_Input;                                    
+			Turntable_ref.Angle = TurntableEncoder.ecd_angle/36.0f;
+			BulletTurntable_ref.Angle = BulletEncoder.ecd_angle/19.0f;
+		}
+		if(GetInputMode() == REMOTE_INPUT)	
+		{
+			if(GetShootState() == SHOOTING)	//普通模式模式 单速度环
+			{	
+				if(Get_Time_Micros() - BulletBlock_TimeStamp < 450000) //正在回拨时间内
+				{
+					PID_Task(&BulletTurntableSpeedPID, -BulletTurntableSpeed, Bullet_Measure.speed_rpm/10.0);		
+				}
+				else
+				{
+					PID_Task(&BulletTurntableSpeedPID, BulletTurntableSpeed, Bullet_Measure.speed_rpm/10.0);
+				}
+				
+				if(Get_Time_Micros() - Block_TimeStamp < 200000) //正在回拨时间内
+				{
+					PID_Task(&ShootMotorSpeedPID, -Turntable_ref.Speed, Turntable_Measure.speed_rpm);		
+				}
+				else
+				{
+					PID_Task(&ShootMotorPositionPID, Turntable_ref.Angle, TurntableEncoder.ecd_angle/REDUCTION);
+					PID_Task(&ShootMotorSpeedPID, ShootMotorPositionPID.output, Turntable_Measure.speed_rpm);
+
+				}
+			}
+			else
+			{
+				PID_Task(&ShootMotorSpeedPID, 0, Turntable_Measure.speed_rpm);
+				PID_Task(&BulletTurntableSpeedPID, 0, 0);
+			}  
+			
+			
+		} 
+		if(GetInputMode() == KEY_MOUSE_INPUT)	
+		{
+
+			if(Get_Time_Micros() - Block_TimeStamp < 200000) //正在回拨时间内
+			{
+				PID_Task(&ShootMotorSpeedPID, -Turntable_ref.Speed, Turntable_Measure.speed_rpm);		
+			}
+			else
+			{
+				PID_Task(&ShootMotorPositionPID, Turntable_ref.Angle, TurntableEncoder.ecd_angle/REDUCTION);
+			  PID_Task(&ShootMotorSpeedPID, ShootMotorPositionPID.output, Turntable_Measure.speed_rpm);
+			}
+			
+			
+//				if(Get_Time_Micros() - BulletBlock_TimeStamp < 450000) //正在回拨时间内
+//				{
+//					PID_Task(&BulletTurntableSpeedPID, -BulletTurntableSpeed, Bullet_Measure.speed_rpm/10.0);		
+//				}
+//				else
+//				{   
+					PID_Task(&BulletTurntablePositionPID, BulletTurntable_ref.Angle, BulletEncoder.ecd_angle/19.0);
+					if(BulletTurntablePositionPID.output >700)
+					PID_Task(&BulletTurntableSpeedPID, BulletTurntableSpeed, Bullet_Measure.speed_rpm/10.0);
+					else PID_Task(&BulletTurntableSpeedPID, 0, Bullet_Measure.speed_rpm/10.0); 
+//				}
+
+			}
+		 
+		
+	}
+
+	else
+	{	
+		ShootMotorSpeedPID.Reset(&ShootMotorSpeedPID);
+		PID_Task(&ShootMotorSpeedPID, 0, 0);
+		
+		//BulletTurntableSpeedPID.Reset(&BulletTurntableSpeedPID);
+		PID_Task(&BulletTurntableSpeedPID, 0, 0); 
+	}
+
+	}
+//	}
+	
+	
+}
